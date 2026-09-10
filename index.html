@@ -2548,5 +2548,37 @@ TOOL_RENDERERS['receipt-generator'] = (mount)=> renderDocGenerator(mount, {
   showTax:false, showDiscount:false, notesLabel:'Payment method / notes'
 });
 </script>
+<script>
+document.addEventListener('contextmenu', function (e) {
+    e.preventDefault();
+});
+
+document.addEventListener('keydown', function (e) {
+
+    // F12
+    if (e.key === 'F12') {
+        e.preventDefault();
+    }
+
+    // Ctrl+Shift+I / Ctrl+Shift+J / Ctrl+Shift+C
+    if (
+        e.ctrlKey &&
+        e.shiftKey &&
+        ['I', 'J', 'C'].includes(e.key.toUpperCase())
+    ) {
+        e.preventDefault();
+    }
+
+    // Ctrl+U (View Source)
+    if (e.ctrlKey && e.key.toUpperCase() === 'U') {
+        e.preventDefault();
+    }
+
+    // Ctrl+S (Save Page)
+    if (e.ctrlKey && e.key.toUpperCase() === 'S') {
+        e.preventDefault();
+    }
+});
+</script>
 </body>
 </html>
