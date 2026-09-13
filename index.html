@@ -10,6 +10,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
 <style>
   :root{
     --bg:#F6F7F5;
@@ -610,6 +611,12 @@ async function ensurePdfJs(){
 async function ensureTesseract(){
   if(!window.Tesseract) await loadScript('https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.0.4/tesseract.min.js');
   return window.Tesseract;
+}
+async function ensureTesseractWorker(){
+  const T=await ensureTesseract();
+  const worker=await T.createWorker('eng');
+  await worker.setParameters({preserve_interword_spaces:'1',user_defined_dpi:'300'});
+  return worker;
 }
 
 /* ---- Shared UI helpers reused across many tools ---- */
@@ -2296,461 +2303,276 @@ TOOL_RENDERERS['pdf-to-excel'] = function(mount){
   };
 };
 
-/* ================= JPG TO EXCEL (OCR) ================= */
+/* ================= JPG TO EXCEL — NETWORK GRID ENGINE ================= */
 TOOL_RENDERERS['jpg-to-excel'] = function(mount){
-  let file=null;
-  mount.innerHTML = `
+  let file=null,lastBlob=null,lastName='reconstructed.xlsx';
+  mount.innerHTML=`
   <div class="tool-shell">
     <div class="panel">
       <h2>1. Upload an image</h2>
       <div id="dz" class="dropzone" tabindex="0" role="button" aria-label="Upload image">
-        <input type="file" id="fileInput" accept="image/jpeg,image/png" class="sr-only"/>
+        <input type="file" id="fileInput" accept="image/jpeg,image/png,image/webp" class="sr-only"/>
         <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
         <div class="dz-title">Drag and drop, or choose a file</div>
-        <div class="dz-sub">A clear, upright photo or scan of a table works best.</div>
+        <div class="dz-sub">Reconstructs bordered tables, multiple independent tables, staggered tables and merged cells into editable Excel.</div>
       </div>
       <div id="fileList"></div>
-      <div class="status show warn">OCR accuracy depends on image quality, font, orientation and table structure. This is not a 100% accurate OCR.</div>
-      <div class="btn-row">
-        <button class="btn btn-primary" id="goBtn" disabled>Run OCR &amp; Convert</button>
-        <button class="btn btn-outline" id="resetBtn">Start Over</button>
-      </div>
+      <div class="status show info">Fast local reconstruction. One OCR pass; table geometry is detected from connected line networks.</div>
+      <div class="btn-row"><button class="btn btn-primary" id="goBtn" disabled>Reconstruct Excel</button><button class="btn btn-outline" id="resetBtn">Start Over</button></div>
       <div class="status" id="status"></div>
     </div>
     <div class="panel">
-      <h2>Preview</h2>
-      <div class="preview-panel" id="preview"><div class="preview-empty">Extracted data will appear here.</div></div>
-      <button class="btn btn-accent" id="downloadBtn" style="display:none; margin-top:16px;">Download XLSX</button>
+      <h2>2. Reconstruction preview</h2>
+      <div class="preview-panel" id="preview"><div class="preview-empty">The reconstructed spreadsheet will appear here.</div></div>
+      <button class="btn btn-accent" id="downloadBtn" style="display:none;margin-top:16px">Download XLSX</button>
     </div>
   </div>`;
-  const dz=mount.querySelector('#dz'), fileInput=mount.querySelector('#fileInput'), fileList=mount.querySelector('#fileList');
-  const goBtn=mount.querySelector('#goBtn'), resetBtn=mount.querySelector('#resetBtn');
-  const statusEl=mount.querySelector('#status'), preview=mount.querySelector('#preview'), downloadBtn=mount.querySelector('#downloadBtn');
-  const setStatus = statusSetter(statusEl);
 
-  wireDropzone(dz, fileInput, (files)=>{
+  const dz=mount.querySelector('#dz'),fileInput=mount.querySelector('#fileInput'),fileList=mount.querySelector('#fileList');
+  const goBtn=mount.querySelector('#goBtn'),resetBtn=mount.querySelector('#resetBtn'),statusEl=mount.querySelector('#status'),preview=mount.querySelector('#preview'),downloadBtn=mount.querySelector('#downloadBtn');
+  const setStatus=statusSetter(statusEl);
+  wireDropzone(dz,fileInput,files=>{
     const f=files[0];
-    if(!['image/jpeg','image/png'].includes(f.type)){ setStatus('err','This file could not be processed. Please choose a JPG or PNG file.'); return; }
-    file=f;
-    fileList.innerHTML = `<div class="file-row"><span class="fname">${escapeHtml(f.name)}</span><span class="fsize">${fmtBytes(f.size)}</span><button aria-label="Remove" onclick="location.reload()">✕</button></div>`;
-    goBtn.disabled=false; setStatus('info','Image selected. Press Run OCR & Convert — this can take 10–30 seconds.');
+    if(!f||!/^image\/(jpeg|png|webp)$/i.test(f.type)){setStatus('err','Please choose a JPG, PNG or WebP image.');return;}
+    file=f;lastBlob=null;fileList.innerHTML=`<div class="file-row"><span class="fname">${escapeHtml(f.name)}</span><span class="fsize">${fmtBytes(f.size)}</span><button id="removeFile" aria-label="Remove">✕</button></div>`;
+    fileList.querySelector('#removeFile').onclick=()=>resetBtn.click();goBtn.disabled=false;downloadBtn.style.display='none';setStatus('info','Image selected.');
   });
-  resetBtn.onclick=()=>{ file=null; fileInput.value=''; fileList.innerHTML=''; goBtn.disabled=true; downloadBtn.style.display='none'; preview.innerHTML=`<div class="preview-empty">Extracted data will appear here.</div>`; statusEl.className='status'; };
+  resetBtn.onclick=()=>{file=null;fileInput.value='';fileList.innerHTML='';goBtn.disabled=true;lastBlob=null;downloadBtn.style.display='none';preview.innerHTML='<div class="preview-empty">The reconstructed spreadsheet will appear here.</div>';statusEl.className='status';};
 
-  goBtn.onclick = async ()=>{
-    if(!file) return;
-    goBtn.disabled=true; setStatus('info','Loading OCR engine (first run only)…');
-    try{
-      const Tesseract = await ensureTesseract();
-      const result = await Tesseract.recognize(file, 'eng', {
-        logger: m=>{ if(m.status && typeof m.progress==='number') setStatus('info', `${m.status} — ${(m.progress*100).toFixed(0)}%`); }
-      });
-      const words = (result.data.words || []).filter(w=>w.text && w.text.trim());
-      if(words.length===0){ setStatus('warn','No text could be recognized in this image. Try a clearer, higher-resolution photo.'); goBtn.disabled=false; return; }
-      // Same global-grid approach as PDF → Excel: cluster row-by-row via bbox midpoint,
-      // then detect column start positions across the WHOLE image so empty cells stay empty.
-      const wordList = words.map(w=>({ text:w.text, x0:w.bbox.x0, x1:w.bbox.x1, _y:(w.bbox.y0+w.bbox.y1)/2 }));
-      const heights = words.map(w=>w.bbox.y1-w.bbox.y0);
-      const rowTol = Math.max(8, (heights.reduce((s,h)=>s+h,0)/heights.length)*0.6);
-      const rowsOfWords = groupWordsIntoRows(wordList, w=>w._y, rowTol);
-      // Column tolerance scales with estimated character width from OCR box sizes.
-      const charWidths = wordList.filter(w=>w.text.length>0).map(w=>(w.x1-w.x0)/w.text.length);
-      const avgCharWidth = charWidths.length ? charWidths.reduce((s,c)=>s+c,0)/charWidths.length : 10;
-      const table = buildGridFromRows(rowsOfWords, Math.max(12, avgCharWidth*2.2));
-      if(table.length===0){ setStatus('warn','No text could be recognized in this image. Try a clearer, higher-resolution photo.'); goBtn.disabled=false; return; }
-      const colCount = Math.max(...table.map(r=>r.length));
-      let html='<table><thead><tr>'; for(let c=0;c<colCount;c++) html+=`<th>Col ${c+1}</th>`; html+='</tr></thead><tbody>';
-      table.slice(0,50).forEach(r=>{ html+='<tr>'+Array.from({length:colCount},(_,c)=>`<td>${escapeHtml(r[c]??'')}</td>`).join('')+'</tr>'; });
-      html+='</tbody></table>';
-      preview.innerHTML = html;
-      const ws = XLSX.utils.aoa_to_sheet(table);
-      ws['!cols'] = autoFitColumns(table);
-      const wb = XLSX.utils.book_new();
-      XLSX.utils.book_append_sheet(wb, ws, 'OCR Result');
-      const out = XLSX.write(wb, {bookType:'xlsx', type:'array'});
-      const blob = new Blob([out], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
-      downloadBtn.style.display='inline-flex';
-      downloadBtn.onclick=()=>downloadBlob(blob, file.name.replace(/\.[^.]+$/,'')+'.xlsx');
-      setStatus('ok','OCR complete. Columns are detected from recurring word positions across the whole image, so empty cells stay empty instead of shifting later data left. Original colors/fonts can\u2019t be reproduced by a free browser library — review the data, especially any row that looks off.');
-    }catch(err){ setStatus('err','OCR could not process this image. Try a clearer photo or a different file.'); }
-    goBtn.disabled=false;
-  };
-};
+  const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+  const median=a=>{if(!a||!a.length)return 0;const b=a.slice().sort((x,y)=>x-y);return b[Math.floor(b.length/2)];};
+  const groupNear=(a,gap)=>{a=a.slice().sort((x,y)=>x-y);const out=[];for(const v of a){if(!out.length||v-out[out.length-1].v>gap)out.push({v,n:1});else{const q=out[out.length-1];q.v=(q.v*q.n+v)/(q.n+1);q.n++;}}return out.map(q=>Math.round(q.v));};
+  const loadImage=f=>new Promise((resolve,reject)=>{const u=URL.createObjectURL(f),im=new Image();im.onload=()=>{URL.revokeObjectURL(u);resolve(im)};im.onerror=e=>{URL.revokeObjectURL(u);reject(e)};im.src=u;});
+  function canvasFromImage(im){const maxW=2800,maxH=4200,s=Math.min(1,maxW/im.naturalWidth,maxH/im.naturalHeight);const c=document.createElement('canvas');c.width=Math.max(1,Math.round(im.naturalWidth*s));c.height=Math.max(1,Math.round(im.naturalHeight*s));c.getContext('2d',{willReadFrequently:true}).drawImage(im,0,0,c.width,c.height);return c;}
+  function geometryCanvas(source){const maxW=1600,maxH=2400,s=Math.min(1,maxW/source.width,maxH/source.height);if(s===1)return source;const c=document.createElement('canvas');c.width=Math.max(1,Math.round(source.width*s));c.height=Math.max(1,Math.round(source.height*s));c.getContext('2d').drawImage(source,0,0,c.width,c.height);return c;}
 
-/* ================= DATA CLEANER ================= */
-TOOL_RENDERERS['data-cleaner'] = function(mount){
-  let file=null, rows=[], isXlsxIn=false;
-  mount.innerHTML = `
-  <div class="tool-shell">
-    <div class="panel">
-      <h2>1. Upload a file</h2>
-      <div id="dz" class="dropzone" tabindex="0" role="button" aria-label="Upload CSV or Excel file">
-        <input type="file" id="fileInput" accept=".csv,.xlsx,.xls" class="sr-only"/>
-        <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-        <div class="dz-title">Drag and drop, or choose a file</div>
-        <div class="dz-sub">CSV or Excel. First row is treated as headers.</div>
-      </div>
-      <div id="fileList"></div>
-      <div class="field">
-        <label>Cleaning steps</label>
-        <div class="checkbox-row"><input type="checkbox" id="optBlank" checked/><label for="optBlank" style="margin:0;">Remove blank rows</label></div>
-        <div class="checkbox-row"><input type="checkbox" id="optDupe" checked/><label for="optDupe" style="margin:0;">Remove duplicate rows</label></div>
-        <div class="checkbox-row"><input type="checkbox" id="optTrim" checked/><label for="optTrim" style="margin:0;">Trim whitespace in every cell</label></div>
-        <div class="checkbox-row"><input type="checkbox" id="optHeaders" checked/><label for="optHeaders" style="margin:0;">Normalize column headers (lowercase, underscores)</label></div>
-      </div>
-      <div class="btn-row">
-        <button class="btn btn-primary" id="goBtn" disabled>Clean</button>
-        <button class="btn btn-outline" id="resetBtn">Start Over</button>
-      </div>
-      <div class="status" id="status"></div>
-    </div>
-    <div class="panel">
-      <h2>Preview</h2>
-      <div class="stat-row" id="stats"></div>
-      <div class="preview-panel" id="preview"><div class="preview-empty">Cleaned data will appear here.</div></div>
-      <button class="btn btn-accent" id="downloadBtn" style="display:none; margin-top:16px;">Download cleaned file</button>
-    </div>
-  </div>`;
-  const dz=mount.querySelector('#dz'), fileInput=mount.querySelector('#fileInput'), fileList=mount.querySelector('#fileList');
-  const goBtn=mount.querySelector('#goBtn'), resetBtn=mount.querySelector('#resetBtn');
-  const statusEl=mount.querySelector('#status'), preview=mount.querySelector('#preview'), stats=mount.querySelector('#stats'), downloadBtn=mount.querySelector('#downloadBtn');
-  const setStatus = statusSetter(statusEl);
-
-  wireDropzone(dz, fileInput, async (files)=>{
-    const f=files[0];
-    const isCsv=/\.csv$/i.test(f.name), isXlsx=/\.(xlsx|xls)$/i.test(f.name);
-    if(!isCsv && !isXlsx){ setStatus('err','This file could not be processed. Please choose a .csv, .xlsx or .xls file.'); return; }
-    file=f; isXlsxIn=isXlsx;
-    fileList.innerHTML = `<div class="file-row"><span class="fname">${escapeHtml(f.name)}</span><span class="fsize">${fmtBytes(f.size)}</span><button aria-label="Remove" onclick="location.reload()">✕</button></div>`;
-    try{
-      if(isXlsx){ const buf=await fileToArrayBuffer(f); const wb=XLSX.read(new Uint8Array(buf),{type:'array'}); rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1}); }
-      else { const text = await fileToText(f); rows = parseCSV(text); }
-      goBtn.disabled=false; setStatus('info', `Loaded ${rows.length} row(s) including header. Choose steps and press Clean.`);
-    }catch(err){ setStatus('err','This file could not be processed. It may be corrupted.'); }
-  });
-  resetBtn.onclick=()=>{ file=null; rows=[]; fileInput.value=''; fileList.innerHTML=''; goBtn.disabled=true; downloadBtn.style.display='none'; preview.innerHTML=`<div class="preview-empty">Cleaned data will appear here.</div>`; stats.innerHTML=''; statusEl.className='status'; };
-
-  goBtn.onclick = ()=>{
-    if(!rows.length) return;
-    const optBlank=mount.querySelector('#optBlank').checked, optDupe=mount.querySelector('#optDupe').checked, optTrim=mount.querySelector('#optTrim').checked, optHeaders=mount.querySelector('#optHeaders').checked;
-    let header = rows[0] ? rows[0].slice() : [];
-    let body = rows.slice(1).map(r=>r.slice());
-    const originalCount = body.length;
-
-    if(optTrim){
-      header = header.map(h=> typeof h==='string'? h.trim() : h);
-      body = body.map(r=> r.map(c=> typeof c==='string'? c.trim() : c));
+  // Geometry mask: neutral/dark pixels. Saturated red/blue/green fills are deliberately excluded.
+  function ruleMask(c){
+    const ctx=c.getContext('2d',{willReadFrequently:true}),d=ctx.getImageData(0,0,c.width,c.height).data,w=c.width,h=c.height,m=new Uint8Array(w*h);
+    for(let i=0,p=0;i<d.length;i+=4,p++){
+      const r=d[i],g=d[i+1],b=d[i+2],mx=Math.max(r,g,b),mn=Math.min(r,g,b),ch=mx-mn,y=.299*r+.587*g+.114*b;
+      m[p]=(y<190&&ch<48)?1:0;
     }
-    if(optHeaders){ header = header.map(h=> String(h??'').trim().toLowerCase().replace(/\s+/g,'_').replace(/[^a-z0-9_]/g,'')); }
-    let blankRemoved=0;
-    if(optBlank){
-      const before=body.length;
-      body = body.filter(r=> r.some(c=> String(c??'').trim() !== ''));
-      blankRemoved = before-body.length;
-    }
-    let dupeRemoved=0;
-    if(optDupe){
-      const seen=new Set(); const out=[];
-      body.forEach(r=>{ const key=JSON.stringify(r); if(!seen.has(key)){ seen.add(key); out.push(r); } else dupeRemoved++; });
-      body = out;
-    }
-
-    stats.innerHTML = `
-      <div class="stat">Original rows<b>${originalCount}</b></div>
-      <div class="stat">Blank removed<b>${blankRemoved}</b></div>
-      <div class="stat">Duplicates removed<b>${dupeRemoved}</b></div>
-      <div class="stat">Final rows<b>${body.length}</b></div>`;
-
-    const finalRows = [header, ...body];
-    let html='<table><thead><tr>'; header.forEach(c=>html+=`<th>${escapeHtml(c)}</th>`); html+='</tr></thead><tbody>';
-    body.slice(0,50).forEach(r=>{ html+='<tr>'+r.map(c=>`<td>${escapeHtml(c??'')}</td>`).join('')+'</tr>'; });
-    html+='</tbody></table>';
-    preview.innerHTML = html;
-
-    let blob, name;
-    if(isXlsxIn){
-      const ws = XLSX.utils.aoa_to_sheet(finalRows);
-      const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Cleaned');
-      const out = XLSX.write(wb,{bookType:'xlsx', type:'array'});
-      blob = new Blob([out], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
-      name = file.name.replace(/\.(xlsx|xls)$/i,'')+'-cleaned.xlsx';
-    } else {
-      const csv = finalRows.map(r=> r.map(c=>{ let v=String(c??''); if(/[",\n]/.test(v)) v='"'+v.replace(/"/g,'""')+'"'; return v; }).join(',')).join('\n');
-      blob = new Blob([csv], {type:'text/csv'});
-      name = file.name.replace(/\.csv$/i,'')+'-cleaned.csv';
-    }
-    downloadBtn.style.display='inline-flex';
-    downloadBtn.onclick=()=>downloadBlob(blob, name);
-    setStatus('ok','Cleaned successfully. Processed entirely in your browser.');
-  };
-};
-
-/* ================= REMOVE DUPLICATE ROWS ================= */
-TOOL_RENDERERS['remove-duplicates'] = function(mount){
-  let file=null, rows=[], isXlsxIn=false;
-  mount.innerHTML = `
-  <div class="tool-shell">
-    <div class="panel">
-      <h2>1. Upload a file</h2>
-      <div id="dz" class="dropzone" tabindex="0" role="button" aria-label="Upload CSV or Excel file">
-        <input type="file" id="fileInput" accept=".csv,.xlsx,.xls" class="sr-only"/>
-        <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-        <div class="dz-title">Drag and drop, or choose a file</div>
-        <div class="dz-sub">CSV or Excel. Exact row matches are treated as duplicates.</div>
-      </div>
-      <div id="fileList"></div>
-      <div class="btn-row">
-        <button class="btn btn-primary" id="goBtn" disabled>Remove duplicates</button>
-        <button class="btn btn-outline" id="resetBtn">Start Over</button>
-      </div>
-      <div class="status" id="status"></div>
-    </div>
-    <div class="panel">
-      <h2>Preview</h2>
-      <div class="stat-row" id="stats"></div>
-      <div class="preview-panel" id="preview"><div class="preview-empty">Cleaned data will appear here.</div></div>
-      <button class="btn btn-accent" id="downloadBtn" style="display:none; margin-top:16px;">Download cleaned file</button>
-    </div>
-  </div>`;
-  const dz=mount.querySelector('#dz'), fileInput=mount.querySelector('#fileInput'), fileList=mount.querySelector('#fileList');
-  const goBtn=mount.querySelector('#goBtn'), resetBtn=mount.querySelector('#resetBtn');
-  const statusEl=mount.querySelector('#status'), preview=mount.querySelector('#preview'), stats=mount.querySelector('#stats'), downloadBtn=mount.querySelector('#downloadBtn');
-  const setStatus = statusSetter(statusEl);
-
-  wireDropzone(dz, fileInput, async (files)=>{
-    const f=files[0];
-    const isCsv=/\.csv$/i.test(f.name), isXlsx=/\.(xlsx|xls)$/i.test(f.name);
-    if(!isCsv && !isXlsx){ setStatus('err','This file could not be processed. Please choose a .csv, .xlsx or .xls file.'); return; }
-    file=f; isXlsxIn=isXlsx;
-    fileList.innerHTML = `<div class="file-row"><span class="fname">${escapeHtml(f.name)}</span><span class="fsize">${fmtBytes(f.size)}</span><button aria-label="Remove" onclick="location.reload()">✕</button></div>`;
-    try{
-      if(isXlsx){ const buf=await fileToArrayBuffer(f); const wb=XLSX.read(new Uint8Array(buf),{type:'array'}); rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1}); }
-      else { const text = await fileToText(f); rows = parseCSV(text); }
-      goBtn.disabled=false; setStatus('info', `Loaded ${rows.length} row(s) including header.`);
-    }catch(err){ setStatus('err','This file could not be processed. It may be corrupted.'); }
-  });
-  resetBtn.onclick=()=>{ file=null; rows=[]; fileInput.value=''; fileList.innerHTML=''; goBtn.disabled=true; downloadBtn.style.display='none'; preview.innerHTML=`<div class="preview-empty">Cleaned data will appear here.</div>`; stats.innerHTML=''; statusEl.className='status'; };
-
-  goBtn.onclick = ()=>{
-    if(!rows.length) return;
-    const header = rows[0]||[];
-    const body = rows.slice(1);
-    const seen=new Set(); const out=[]; let dupes=0;
-    body.forEach(r=>{ const key=JSON.stringify(r); if(!seen.has(key)){ seen.add(key); out.push(r); } else dupes++; });
-    stats.innerHTML = `
-      <div class="stat">Original rows<b>${body.length}</b></div>
-      <div class="stat">Duplicate rows<b>${dupes}</b></div>
-      <div class="stat">Cleaned rows<b>${out.length}</b></div>`;
-    let html='<table><thead><tr>'; header.forEach(c=>html+=`<th>${escapeHtml(c)}</th>`); html+='</tr></thead><tbody>';
-    out.slice(0,50).forEach(r=>{ html+='<tr>'+r.map(c=>`<td>${escapeHtml(c??'')}</td>`).join('')+'</tr>'; });
-    html+='</tbody></table>';
-    preview.innerHTML = html;
-    const finalRows=[header, ...out];
-    let blob, name;
-    if(isXlsxIn){
-      const ws=XLSX.utils.aoa_to_sheet(finalRows); const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb,ws,'Deduplicated');
-      const outB=XLSX.write(wb,{bookType:'xlsx',type:'array'}); blob=new Blob([outB],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
-      name=file.name.replace(/\.(xlsx|xls)$/i,'')+'-deduped.xlsx';
-    } else {
-      const csv=finalRows.map(r=>r.map(c=>{let v=String(c??''); if(/[",\n]/.test(v)) v='"'+v.replace(/"/g,'""')+'"'; return v;}).join(',')).join('\n');
-      blob=new Blob([csv],{type:'text/csv'}); name=file.name.replace(/\.csv$/i,'')+'-deduped.csv';
-    }
-    downloadBtn.style.display='inline-flex'; downloadBtn.onclick=()=>downloadBlob(blob,name);
-    setStatus('ok','Done. Processed entirely in your browser.');
-  };
-};
-
-/* ================= SIMPLE CALCULATORS ================= */
-TOOL_RENDERERS['discount-calculator'] = (mount)=> renderCalculator(mount, {
-  fields:[ {id:'price', label:'Original price', placeholder:'2000'}, {id:'pct', label:'Discount %', placeholder:'20'} ],
-  compute: ({price,pct})=>{
-    const discountAmt = price*pct/100; const final = price-discountAmt;
-    return {lines:[['Discount amount', discountAmt.toLocaleString(undefined,{maximumFractionDigits:2})], ['Final price', final.toLocaleString(undefined,{maximumFractionDigits:2})]]};
+    return m;
   }
-});
-TOOL_RENDERERS['commission-calculator'] = (mount)=> renderCalculator(mount, {
-  fields:[ {id:'sales', label:'Sales value', placeholder:'500000'}, {id:'rate', label:'Commission rate %', placeholder:'5'} ],
-  compute: ({sales,rate})=>{
-    const commission = sales*rate/100;
-    return {lines:[['Commission amount', commission.toLocaleString(undefined,{maximumFractionDigits:2})], ['Net to business', (sales-commission).toLocaleString(undefined,{maximumFractionDigits:2})]]};
-  }
-});
-TOOL_RENDERERS['inventory-calculator'] = (mount)=> renderCalculator(mount, {
-  intro:'Closing stock = opening stock + purchases − sales + returns.',
-  fields:[ {id:'opening', label:'Opening stock', placeholder:'100'}, {id:'purchases', label:'Purchases', placeholder:'50'}, {id:'sales', label:'Sales', placeholder:'70'}, {id:'returns', label:'Returns (added back to stock)', placeholder:'5'} ],
-  compute: ({opening,purchases,sales,returns})=>{
-    const closing = opening+purchases-sales+returns;
-    const out = {lines:[['Closing stock', closing.toLocaleString(undefined,{maximumFractionDigits:2})]]};
-    if(closing<0) out.warn = 'Closing stock is negative — check your sales figure against opening stock and purchases.';
+  function runSegments(mask,w,h,horizontal){
+    const out=[];
+    const major=horizontal?w:h,minor=horizontal?h:w;
+    const minLen=Math.max(28,Math.round(major*.018));
+    const maxGap=Math.max(1,Math.round(major*.0015));
+    if(horizontal){
+      for(let y=0;y<h;y++){
+        let x=0;
+        while(x<w){while(x<w&&!mask[y*w+x])x++;if(x>=w)break;const s=x;let last=x;
+          while(x<w){if(mask[y*w+x]){last=x;x++;continue;}let g=x;while(g<w&&!mask[y*w+g]&&g-x<=maxGap)g++;if(g-x<=maxGap&&g<w){x=g;continue;}break;}
+          const e=last+1;if(e-s>=minLen)out.push({p:y,a:s,b:e-1,len:e-s});
+        }
+      }
+    }else{
+      for(let x=0;x<w;x++){
+        let y=0;
+        while(y<h){while(y<h&&!mask[y*w+x])y++;if(y>=h)break;const s=y;let last=y;
+          while(y<h){if(mask[y*w+x]){last=y;y++;continue;}let g=y;while(g<h&&!mask[g*w+x]&&g-y<=maxGap)g++;if(g-y<=maxGap&&g<h){y=g;continue;}break;}
+          const e=last+1;if(e-s>=minLen)out.push({p:x,a:s,b:e-1,len:e-s});
+        }
+      }
+    }
     return out;
   }
-});
-TOOL_RENDERERS['reorder-calculator'] = (mount)=> renderCalculator(mount, {
-  intro:'Reorder point = (average daily usage × lead time) + safety stock.',
-  fields:[ {id:'current', label:'Current stock', placeholder:'200'}, {id:'usage', label:'Average daily usage', placeholder:'10'}, {id:'lead', label:'Lead time (days)', placeholder:'7'}, {id:'safety', label:'Safety stock', placeholder:'20'} ],
-  compute: ({current,usage,lead,safety})=>{
-    const reorderPoint = usage*lead + safety;
-    const lines = [['Reorder point', reorderPoint.toLocaleString(undefined,{maximumFractionDigits:2})]];
-    let warn;
-    if(usage>0){
-      const daysLeft = current/usage;
-      const stockOutDate = new Date(); stockOutDate.setDate(stockOutDate.getDate()+Math.floor(daysLeft));
-      lines.push(['Days of stock remaining', Math.floor(daysLeft)]);
-      lines.push(['Estimated stock-out date', stockOutDate.toLocaleDateString()]);
-      if(current <= reorderPoint) warn = 'Current stock is at or below the reorder point — time to reorder.';
+  function consolidateSegments(segs,gap){
+    const groups=[];
+    for(const s of segs.sort((a,b)=>a.p-b.p)){
+      let g=groups.length?groups[groups.length-1]:null;
+      if(!g||s.p-g.p>gap){g={p:s.p,segments:[],n:0};groups.push(g);}
+      g.p=(g.p*g.n+s.p)/(g.n+1);g.n++;g.segments.push({a:s.a,b:s.b,len:s.len});
     }
-    return {lines, warn};
+    for(const g of groups){
+      g.p=Math.round(g.p);g.segments.sort((a,b)=>a.a-b.a);
+      const merged=[];for(const s of g.segments){const z=merged[merged.length-1];if(z&&s.a<=z.b+3){z.b=Math.max(z.b,s.b);z.len=z.b-z.a+1;}else merged.push({...s});}
+      g.segments=merged;g.coverage=merged.reduce((n,s)=>n+s.len,0);g.min=Math.min(...merged.map(s=>s.a));g.max=Math.max(...merged.map(s=>s.b));
+    }
+    return groups;
   }
-});
-TOOL_RENDERERS['age-calculator'] = (mount)=> renderCalculator(mount, {
-  fields:[ {id:'dob', label:'Date of birth', type:'date'} ],
-  compute: ({dob})=>{
-    const birth = new Date(dob); const today = new Date();
-    if(isNaN(birth.getTime())) return {err:'Enter a valid date.'};
-    if(birth>today) return {err:'Date of birth is in the future.'};
-    let years = today.getFullYear()-birth.getFullYear();
-    let months = today.getMonth()-birth.getMonth();
-    let days = today.getDate()-birth.getDate();
-    if(days<0){ months--; const prevMonth = new Date(today.getFullYear(), today.getMonth(), 0); days += prevMonth.getDate(); }
-    if(months<0){ years--; months += 12; }
-    const totalDays = Math.floor((today-birth)/(1000*60*60*24));
-    return {lines:[['Age', `${years} years, ${months} months, ${days} days`], ['Total days lived', totalDays.toLocaleString()]]};
-  }
-});
-TOOL_RENDERERS['date-difference'] = (mount)=> renderCalculator(mount, {
-  fields:[ {id:'d1', label:'From date', type:'date'}, {id:'d2', label:'To date', type:'date'} ],
-  compute: ({d1,d2})=>{
-    const a=new Date(d1), b=new Date(d2);
-    if(isNaN(a.getTime())||isNaN(b.getTime())) return {err:'Enter two valid dates.'};
-    const diffMs = b-a; const days = Math.round(diffMs/(1000*60*60*24));
-    return {lines:[['Difference', `${Math.abs(days).toLocaleString()} day(s)`], ['Weeks (approx.)', (Math.abs(days)/7).toFixed(1)]], warn: days<0? 'The "To" date is before the "From" date.' : undefined};
-  }
-});
-TOOL_RENDERERS['roi-calculator'] = (mount)=> renderCalculator(mount, {
-  fields:[ {id:'initial', label:'Initial investment', placeholder:'100000'}, {id:'final', label:'Final value', placeholder:'135000'} ],
-  compute: ({initial,final})=>{
-    if(initial===0) return {err:"Initial investment can't be zero."};
-    const gain = final-initial; const roi = (gain/initial)*100;
-    return {lines:[['Net gain / loss', gain.toLocaleString(undefined,{maximumFractionDigits:2})], ['ROI', roi.toFixed(2)+'%']], warn: gain<0?'This investment shows a net loss.':undefined};
-  }
-});
-TOOL_RENDERERS['loan-emi-calculator'] = (mount)=> renderCalculator(mount, {
-  fields:[ {id:'principal', label:'Loan amount', placeholder:'1000000'}, {id:'rate', label:'Annual interest rate %', placeholder:'12'}, {id:'months', label:'Tenure (months)', placeholder:'36'} ],
-  compute: ({principal,rate,months})=>{
-    if(months<=0) return {err:'Tenure must be greater than zero.'};
-    const r = rate/100/12;
-    let emi;
-    if(r===0){ emi = principal/months; }
-    else { emi = principal * r * Math.pow(1+r,months) / (Math.pow(1+r,months)-1); }
-    const total = emi*months; const interest = total-principal;
-    return {lines:[['Monthly installment (EMI)', emi.toLocaleString(undefined,{maximumFractionDigits:2})], ['Total payment', total.toLocaleString(undefined,{maximumFractionDigits:2})], ['Total interest', interest.toLocaleString(undefined,{maximumFractionDigits:2})]]};
-  }
-});
-TOOL_RENDERERS['fuel-cost-calculator'] = (mount)=> renderCalculator(mount, {
-  fields:[ {id:'distance', label:'Distance (km)', placeholder:'250'}, {id:'mileage', label:'Fuel efficiency (km per litre)', placeholder:'14'}, {id:'price', label:'Fuel price per litre', placeholder:'280'} ],
-  compute: ({distance,mileage,price})=>{
-    if(mileage<=0) return {err:'Fuel efficiency must be greater than zero.'};
-    const litres = distance/mileage; const cost = litres*price;
-    return {lines:[['Fuel needed', litres.toFixed(2)+' L'], ['Estimated cost', cost.toLocaleString(undefined,{maximumFractionDigits:2})]]};
-  }
-});
-TOOL_RENDERERS['electricity-cost-calculator'] = (mount)=> renderCalculator(mount, {
-  fields:[ {id:'units', label:'Units consumed (kWh)', placeholder:'350'}, {id:'rate', label:'Rate per unit', placeholder:'45'}, {id:'fixed', label:'Fixed charges (optional)', placeholder:'0'} ],
-  compute: ({units,rate,fixed})=>{
-    const fixedCharge = isNaN(fixed)?0:fixed;
-    const cost = units*rate + fixedCharge;
-    return {lines:[['Energy cost', (units*rate).toLocaleString(undefined,{maximumFractionDigits:2})], ['Fixed charges', fixedCharge.toLocaleString(undefined,{maximumFractionDigits:2})], ['Estimated total bill', cost.toLocaleString(undefined,{maximumFractionDigits:2})]]};
-  }
-});
-TOOL_RENDERERS['currency-converter'] = (mount)=> renderCalculator(mount, {
-  intro:'Enter the exchange rate yourself — DTS does not fetch live rates, so the result is only as current as the rate you provide.',
-  fields:[ {id:'amount', label:'Amount', placeholder:'1000'}, {id:'rate', label:'Exchange rate (1 unit of source = ? target)', placeholder:'278.50'} ],
-  compute: ({amount,rate})=> ({lines:[['Converted amount', (amount*rate).toLocaleString(undefined,{maximumFractionDigits:2})]]})
-});
+  function intervalOverlap(a1,a2,b1,b2){return Math.max(0,Math.min(a2,b2)-Math.max(a1,b1)+1);}
 
-/* ================= UNIT CONVERTER ================= */
-TOOL_RENDERERS['unit-converter'] = function(mount){
-  const CATS = {
-    length: {base:'m', units:{mm:0.001, cm:0.01, m:1, km:1000, inch:0.0254, ft:0.3048, yard:0.9144, mile:1609.344}},
-    weight: {base:'kg', units:{mg:0.000001, g:0.001, kg:1, tonne:1000, oz:0.0283495, lb:0.453592}},
-    area: {base:'m2', units:{'m²':1, 'km²':1000000, 'cm²':0.0001, hectare:10000, acre:4046.86, 'ft²':0.092903}},
-    volume: {base:'l', units:{ml:0.001, l:1, 'm³':1000, gallon:3.78541, quart:0.946353, pint:0.473176}},
-    temperature: {base:'c', special:true},
-    speed: {base:'mps', units:{'m/s':1, 'km/h':0.277778, mph:0.44704, knot:0.514444}},
-    time: {base:'s', units:{s:1, min:60, hour:3600, day:86400, week:604800}},
-    data: {base:'byte', units:{byte:1, KB:1024, MB:1024*1024, GB:1024*1024*1024, TB:1024*1024*1024*1024}},
+  // True 2-D intersection test. A vertical segment intersects a horizontal
+  // segment only when the vertical x lies inside the horizontal x-span AND
+  // the horizontal y lies inside the vertical y-span.
+  function segmentsIntersect(v,h){
+    return v.p>=h.a && v.p<=h.b && h.p>=v.a && h.p<=v.b;
+  }
+
+  function detectNetworkGrid(source){
+    const gc=geometryCanvas(source),gw=gc.width,gh=gc.height,mask=ruleMask(gc);
+    const rawH=runSegments(mask,gw,gh,true),rawV=runSegments(mask,gw,gh,false);
+    const H0=consolidateSegments(rawH,2),V0=consolidateSegments(rawV,2);
+    if(H0.length<2||V0.length<2)return null;
+
+    // Count REAL 2-D intersections, not interval overlap between unrelated axes.
+    // This is the key structural filter: text strokes may be long, but they
+    // rarely form repeated perpendicular border intersections.
+    const hNet=h=>V0.reduce((n,v)=>n+(segmentsIntersect(v,h)?1:0),0);
+    const vNet=v=>H0.reduce((n,h)=>n+(segmentsIntersect(v,h)?1:0),0);
+
+    // Keep strong outer/long rules plus lines that participate in a network.
+    // Thresholds are based on the number of actual perpendicular crossings.
+    const hKeep=H0.filter(h=>hNet(h)>=2 || h.coverage>=gw*.28);
+    const vKeep=V0.filter(v=>vNet(v)>=2 || v.coverage>=gh*.28);
+    if(hKeep.length<2||vKeep.length<2)return null;
+
+    const sx=source.width/gw,sy=source.height/gh;
+    let xs=groupNear(vKeep.map(v=>v.p*sx),Math.max(3,sx*2.2));
+    let ys=groupNear(hKeep.map(h=>h.p*sy),Math.max(3,sy*2.2));
+    xs=xs.filter((x,i)=>i===0||x-xs[i-1]>=10);
+    ys=ys.filter((y,i)=>i===0||y-ys[i-1]>=10);
+    if(xs.length<2||ys.length<2)return null;
+
+    // Preserve segment topology for local edge scoring. Coordinates are kept
+    // in source-image space while lineInfo retains the downsampled mask.
+    const scaleBackH=hKeep.map(h=>({p:h.p*sy,a:h.a*sx,b:h.b*sx,coverage:h.coverage*sx,net:hNet(h)}));
+    const scaleBackV=vKeep.map(v=>({p:v.p*sx,a:v.a*sy,b:v.b*sy,coverage:v.coverage*sy,net:vNet(v)}));
+    return {V:xs,H:ys,lineInfo:{mask,gw,gh,sx,sy,H:scaleBackH,V:scaleBackV},quality:{v:xs.length-1,h:ys.length-1}};
+  }
+
+  function pointLineSupport(grid,x,y,vertical){
+    const li=grid.lineInfo;if(!li)return 0;const {mask,gw,gh,sx,sy}=li;
+    const px=Math.round(x/sx),py=Math.round(y/sy),radius=2,span=vertical?Math.max(3,Math.round(5/sy)):Math.max(3,Math.round(5/sx));
+    let hit=0,total=0;
+    for(let d=-span;d<=span;d++){
+      const xx=vertical?px:Math.max(0,Math.min(gw-1,px+d)),yy=vertical?Math.max(0,Math.min(gh-1,py+d)):py;total++;
+      let ok=false;for(let oy=-radius;oy<=radius&&!ok;oy++)for(let ox=-radius;ox<=radius;ox++){const ax=xx+ox,ay=yy+oy;if(ax>=0&&ax<gw&&ay>=0&&ay<gh&&mask[ay*gw+ax]){ok=true;break;}}
+      if(ok)hit++;
+    }
+    return hit/Math.max(1,total);
+  }
+  function edgeSupport(grid,r,c,edge){
+    const x1=grid.V[c],x2=grid.V[c+1],y1=grid.H[r],y2=grid.H[r+1];
+    if(edge==='left')return lineSegmentSupport(grid,x1,y1,y2,true);
+    if(edge==='right')return lineSegmentSupport(grid,x2,y1,y2,true);
+    if(edge==='top')return lineSegmentSupport(grid,y1,x1,x2,false);
+    return lineSegmentSupport(grid,y2,x1,x2,false);
+  }
+  function lineSegmentSupport(grid,p,a,b,vertical){
+    const n=Math.max(5,Math.min(30,Math.round((b-a)/Math.max(12,vertical?grid.H.length:grid.V.length))));let hit=0;
+    for(let i=0;i<n;i++){const q=a+(i+.5)*(b-a)/n;hit+=pointLineSupport(grid,vertical?p:q,vertical?q:p,vertical);}
+    return hit/n;
+  }
+
+  function wordsFromResult(r){
+    return (r.data.words||[]).filter(w=>w.text&&w.text.trim()&&Number(w.confidence)>=10).map(w=>({text:w.text.trim(),x0:w.bbox.x0,y0:w.bbox.y0,x1:w.bbox.x1,y1:w.bbox.y1,cx:(w.bbox.x0+w.bbox.x1)/2,cy:(w.bbox.y0+w.bbox.y1)/2,conf:Number(w.confidence)||0}));
+  }
+  function wordLines(words){
+    const hs=words.map(w=>Math.max(4,w.y1-w.y0)),tol=Math.max(5,median(hs)*.7),lines=[];
+    for(const w of words){let best=null,bd=1e9;for(const l of lines){const d=Math.abs(l.cy-w.cy);if(d<tol&&d<bd){best=l;bd=d;}}if(!best){best={cy:w.cy,words:[]};lines.push(best);}best.words.push(w);best.cy=median(best.words.map(q=>q.cy));}
+    return lines.sort((a,b)=>a.cy-b.cy).map(l=>{l.words.sort((a,b)=>a.x0-b.x0);return l;});
+  }
+  function fallbackGrid(words,w,h){
+    const lines=wordLines(words);if(lines.length<2)return null;
+    const rowCenters=lines.map(l=>median(l.words.map(q=>q.cy))),rowH=median(lines.map(l=>Math.max(10,median(l.words.map(q=>q.y1-q.y0))*1.8)));
+    const H=[Math.max(0,rowCenters[0]-rowH/2)];for(let i=1;i<rowCenters.length;i++)H.push((rowCenters[i-1]+rowCenters[i])/2);H.push(Math.min(h,rowCenters[rowCenters.length-1]+rowH/2));
+    const starts=[];for(const l of lines)for(const q of l.words)starts.push(q.x0);const sg=groupNear(starts,Math.max(8,Math.round(w*.008)));
+    const counts=sg.map(x=>lines.filter(l=>l.words.some(q=>Math.abs(q.x0-x)<Math.max(8,w*.008))).length);const need=Math.max(2,Math.ceil(lines.length*.08));let xs=sg.filter((x,i)=>counts[i]>=need);if(xs.length<2)xs=sg.filter((x,i)=>counts[i]>=2);if(xs.length<2)return null;
+    const V=[Math.max(0,xs[0]-10)];for(let i=1;i<xs.length;i++)V.push((xs[i-1]+xs[i])/2);V.push(w);return {V,H,lineInfo:null,fallback:true,quality:{v:V.length-1,h:H.length-1}};
+  }
+  function wordAtCell(w,grid){let c=-1,r=-1;for(let i=0;i<grid.V.length-1;i++)if(w.cx>=grid.V[i]&&w.cx<grid.V[i+1]){c=i;break;}for(let i=0;i<grid.H.length-1;i++)if(w.cy>=grid.H[i]&&w.cy<grid.H[i+1]){r=i;break;}return r>=0&&c>=0?{r,c}:null;}
+  function cellWords(words,grid,r,c){return words.filter(w=>{const q=wordAtCell(w,grid);return q&&q.r===r&&q.c===c;}).sort((a,b)=>a.y0-b.y0||a.x0-b.x0);}
+  function textFromWords(ws){if(!ws.length)return '';const tol=Math.max(5,median(ws.map(w=>w.y1-w.y0))*.7),lines=[];for(const w of ws){let l=lines.find(q=>Math.abs(q.cy-w.cy)<tol);if(!l){l={cy:w.cy,words:[]};lines.push(l);}l.words.push(w);l.cy=median(l.words.map(q=>q.cy));}return lines.sort((a,b)=>a.cy-b.cy).map(l=>l.words.sort((a,b)=>a.x0-b.x0).map(w=>w.text).join(' ')).join('\n').trim();}
+  function cleanOCRText(t){return String(t||'').replace(/[|¦]+/g,' ').replace(/[\\]+/g,' ').replace(/\s+/g,' ').trim();}
+
+  // If OCR puts a word across a candidate boundary and the boundary has little/no line support,
+  // treat that candidate as an OCR artifact rather than splitting the word into separate cells.
+  function refineGrid(grid,words){
+    if(!grid||grid.fallback)return grid;
+    const V=grid.V.slice(),H=grid.H.slice();
+    const cross=(x,vertical)=>words.reduce((n,w)=>n+(vertical?(w.x0<x&&w.x1>x):(w.y0<x&&w.y1>x)),0);
+    for(let i=1;i<V.length-1;){const x=V[i],p=cross(x,true);let local=0;for(let r=0;r<grid.H.length-1;r++)local=Math.max(local,edgeSupport(grid,r,i-1,'right'));if(p>=Math.max(4,Math.ceil(words.length*.003))&&local<.30)V.splice(i,1);else i++;}
+    for(let i=1;i<H.length-1;){const y=H[i],p=cross(y,false);let local=0;for(let c=0;c<grid.V.length-1;c++)local=Math.max(local,edgeSupport(grid,i-1,c,'bottom'));if(p>=Math.max(4,Math.ceil(words.length*.003))&&local<.30)H.splice(i,1);else i++;}
+    return {...grid,V,H};
+  }
+
+  function buildMatrix(words,grid){
+    const R=grid.H.length-1,C=grid.V.length-1,m=Array.from({length:R},()=>Array(C).fill(''));
+    for(let r=0;r<R;r++)for(let c=0;c<C;c++)m[r][c]=cleanOCRText(textFromWords(cellWords(words,grid,r,c)));
+    return m;
+  }
+  function deriveMerges(grid,words){
+    if(grid.fallback)return [];
+    const R=grid.H.length-1,C=grid.V.length-1,merges=[];
+    // Only merge adjacent cells when the shared physical border is absent AND both cells belong
+    // to the same local table row. This is deliberately local, allowing multiple/staggered tables.
+    for(let r=0;r<R;r++){
+      let start=null;
+      for(let c=0;c<C-1;c++){
+        const s=edgeSupport(grid,r,c,'right'),emptyA=!cellWords(words,grid,r,c).length,emptyB=!cellWords(words,grid,r,c+1).length;
+        const join=s<.18&&(emptyA||emptyB||s<.05);
+        if(join&&start===null)start=c;
+        if((!join||c===C-2)&&start!==null){const end=join&&c===C-2?c+1:c;if(end-start>=1)merges.push({r1:r,c1:start,r2:r,c2:end});start=null;}
+      }
+    }
+    return merges;
+  }
+  function mergeLookup(merges){const m=new Map();for(const q of merges)for(let r=q.r1;r<=q.r2;r++)for(let c=q.c1;c<=q.c2;c++)m.set(r+':'+c,q);return m;}
+  function normalizeValue(t){const s=String(t||'').trim(),n=s.replace(/[ ,]/g,'');if(/^[-+]?\d+(?:\.\d+)?$/.test(n))return {v:Number(n)};if(/^[-+]?\d+(?:\.\d+)?%$/.test(n))return {v:Number(n.slice(0,-1))/100,fmt:'0.00%'};return {v:s};}
+  function cellStyle(grid,r,c,ws){if(!ws.length)return {font:{name:'Arial',size:10},alignment:{vertical:'middle',horizontal:'left',wrapText:true}};const h=median(ws.map(w=>w.y1-w.y0));const bold=ws.some(w=>w.conf>65&&/^[A-Z0-9 &%\-]+$/.test(w.text))&&r<3;return {font:{name:'Arial',size:clamp(h*.78,8,18),bold},alignment:{vertical:'middle',horizontal:'left',wrapText:true}};}
+  function applyBorders(cell,grid,r,c){if(grid.fallback){cell.border={};return;}const mk=s=>s>.42?{style:'thin',color:{argb:'FF777777'}}:undefined;cell.border={top:mk(edgeSupport(grid,r,c,'top')),bottom:mk(edgeSupport(grid,r,c,'bottom')),left:mk(edgeSupport(grid,r,c,'left')),right:mk(edgeSupport(grid,r,c,'right'))};}
+  async function buildWorkbook(matrix,merges,grid,words){
+    const wb=new ExcelJS.Workbook(),ws=wb.addWorksheet('Reconstructed'),R=matrix.length,C=Math.max(1,...matrix.map(r=>r.length));
+    for(let c=0;c<C;c++){const width=grid.V[c+1]-grid.V[c];ws.getColumn(c+1).width=clamp(width/7.2,3,60);}
+    for(let r=0;r<R;r++)ws.getRow(r+1).height=clamp((grid.H[r+1]-grid.H[r])*.72,10,110);
+    for(let r=0;r<R;r++)for(let c=0;c<C;c++){const cell=ws.getCell(r+1,c+1),txt=matrix[r][c]||'',typed=normalizeValue(txt),cw=cellWords(words,grid,r,c);cell.value=typed.v;if(typed.fmt)cell.numFmt=typed.fmt;Object.assign(cell,cellStyle(grid,r,c,cw));applyBorders(cell,grid,r,c);}
+    for(const m of merges)try{ws.mergeCells(m.r1+1,m.c1+1,m.r2+1,m.c2+1);}catch(e){}
+    return wb;
+  }
+  function previewTable(matrix,merges){
+    const R=matrix.length,C=Math.max(1,...matrix.map(r=>r.length));let html='<div style="overflow:auto"><table><tbody>';const covered=new Set();for(const m of merges)for(let r=m.r1;r<=m.r2;r++)for(let c=m.c1;c<=m.c2;c++)covered.add(r+':'+c);
+    for(let r=0;r<R;r++){html+='<tr>';for(let c=0;c<C;c++){if(covered.has(r+':'+c)&&!merges.some(m=>m.r1===r&&m.c1===c))continue;const m=merges.find(q=>q.r1===r&&q.c1===c),rs=m?m.r2-m.r1+1:1,cs=m?m.c2-m.c1+1:1;html+=`<td${rs>1?` rowspan="${rs}"`:''}${cs>1?` colspan="${cs}"`:''}>${escapeHtml(matrix[r][c]||'').replace(/\n/g,'<br>')}</td>`;}html+='</tr>';}return html+'</tbody></table></div>';
+  }
+
+  goBtn.onclick=async()=>{
+    if(!file)return;goBtn.disabled=true;downloadBtn.style.display='none';lastBlob=null;let worker=null;
+    try{
+      setStatus('info','1/4 — Detecting connected table-line networks…');const im=await loadImage(file),source=canvasFromImage(im);let grid=detectNetworkGrid(source);
+      setStatus('info','2/4 — Reading text once with OCR…');worker=await ensureTesseractWorker();await worker.setParameters({tessedit_pageseg_mode:'11',preserve_interword_spaces:'1',user_defined_dpi:'300'});const result=await worker.recognize(source);const words=wordsFromResult(result);
+      if(!grid)grid=fallbackGrid(words,source.width,source.height);else grid=refineGrid(grid,words);if(!grid)throw new Error('No usable table structure could be inferred from this image.');
+      setStatus('info',`3/4 — Mapping ${words.length} OCR words into ${grid.V.length-1} columns × ${grid.H.length-1} rows…`);const matrix=buildMatrix(words,grid),merges=deriveMerges(grid,words);if(!matrix.flat().some(Boolean))throw new Error('OCR did not produce readable table text.');
+      preview.innerHTML=previewTable(matrix,merges);setStatus('info','4/4 — Building editable XLSX…');const wb=await buildWorkbook(matrix,merges,grid,words),buf=await wb.xlsx.writeBuffer();lastBlob=new Blob([buf],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});lastName=file.name.replace(/\.[^.]+$/,'')+'-reconstructed.xlsx';downloadBtn.style.display='inline-flex';downloadBtn.onclick=()=>downloadBlob(lastBlob,lastName);
+      setStatus('ok',`Done: ${grid.V.length-1} columns × ${grid.H.length-1} rows, ${words.length} OCR words, ${merges.length} local merge(s).`);
+    }catch(err){console.error(err);setStatus('err',err&&err.message?err.message:'Could not reconstruct this image.');}
+    finally{if(worker)try{await worker.terminate()}catch(e){}goBtn.disabled=false;}
   };
-  mount.innerHTML = `
-  <div class="tool-shell">
-    <div class="panel">
-      <h2>Convert</h2>
-      <div class="field" style="margin-top:0;"><label>Category</label>
-        <select id="catSel">${Object.keys(CATS).map(c=>`<option value="${c}">${c.charAt(0).toUpperCase()+c.slice(1)}</option>`).join('')}</select>
-      </div>
-      <div class="calc-grid">
-        <div class="field" style="margin-top:0;"><label>From</label><select id="fromSel"></select></div>
-        <div class="field" style="margin-top:0;"><label>To</label><select id="toSel"></select></div>
-      </div>
-      <div class="field"><label>Value</label><input type="number" id="valInput" placeholder="1"/></div>
-    </div>
-    <div class="panel">
-      <h2>Result</h2>
-      <div id="resultArea"><div class="preview-empty">Enter a value to convert.</div></div>
-    </div>
-  </div>`;
-  const catSel=mount.querySelector('#catSel'), fromSel=mount.querySelector('#fromSel'), toSel=mount.querySelector('#toSel'), valInput=mount.querySelector('#valInput'), resultArea=mount.querySelector('#resultArea');
-
-  function populateUnits(){
-    const cat = CATS[catSel.value];
-    const names = cat.special ? ['C','F','K'] : Object.keys(cat.units);
-    fromSel.innerHTML = names.map(n=>`<option value="${n}">${n}</option>`).join('');
-    toSel.innerHTML = names.map((n,i)=>`<option value="${n}" ${i===1?'selected':''}>${n}</option>`).join('');
-    compute();
-  }
-  function toCelsius(v,u){ if(u==='C') return v; if(u==='F') return (v-32)*5/9; if(u==='K') return v-273.15; }
-  function fromCelsius(v,u){ if(u==='C') return v; if(u==='F') return v*9/5+32; if(u==='K') return v+273.15; }
-
-  function compute(){
-    const v = parseFloat(valInput.value);
-    if(isNaN(v)){ resultArea.innerHTML = `<div class="preview-empty">Enter a value to convert.</div>`; return; }
-    const cat = CATS[catSel.value];
-    let result;
-    if(cat.special){ result = fromCelsius(toCelsius(v, fromSel.value), toSel.value); }
-    else { const base = v * cat.units[fromSel.value]; result = base / cat.units[toSel.value]; }
-    resultArea.innerHTML = `<div class="result-box"><div class="result-line"><span>${v} ${fromSel.value}</span><b>${(+result.toFixed(6))} ${toSel.value}</b></div></div>`;
-  }
-  catSel.onchange = populateUnits; fromSel.onchange = compute; toSel.onchange = compute; valInput.oninput = compute;
-  populateUnits();
 };
 
-/* ================= DOCUMENT GENERATORS ================= */
-TOOL_RENDERERS['invoice-generator'] = (mount)=> renderDocGenerator(mount, {
-  docLabel:'Invoice',
-  headerFields:[ {id:'bizName', label:'Business name', placeholder:'Imran Electronics'}, {id:'docNumber', label:'Invoice number', placeholder:'INV-1001'}, {id:'docDate', label:'Date', type:'date'} ],
-  partyFields:[ {id:'party', label:'Bill to', placeholder:'Customer name & address'}, {id:'bizAddress', label:'Your business address', placeholder:'Address, city, phone'} ],
-  itemCols:[ {id:'desc', label:'Description'}, {id:'qty', label:'Qty', type:'number'}, {id:'rate', label:'Unit price', type:'number'} ],
-  showTax:true, showDiscount:true, notesLabel:'Notes / payment terms'
+</script>
+<script>
+document.addEventListener('contextmenu', function (e) {
+    e.preventDefault();
 });
-TOOL_RENDERERS['quotation-generator'] = (mount)=> renderDocGenerator(mount, {
-  docLabel:'Quotation',
-  headerFields:[ {id:'bizName', label:'Business name', placeholder:'Imran Electronics'}, {id:'docNumber', label:'Quotation number', placeholder:'QUO-1001'}, {id:'docDate', label:'Date', type:'date'}, {id:'validity', label:'Valid until', type:'date'} ],
-  partyFields:[ {id:'party', label:'Quotation for', placeholder:'Customer name & address'}, {id:'bizAddress', label:'Your business address', placeholder:'Address, city, phone'} ],
-  itemCols:[ {id:'desc', label:'Description'}, {id:'qty', label:'Qty', type:'number'}, {id:'rate', label:'Unit price', type:'number'} ],
-  showTax:true, showDiscount:true, notesLabel:'Terms & conditions'
-});
-TOOL_RENDERERS['purchase-order-generator'] = (mount)=> renderDocGenerator(mount, {
-  docLabel:'Purchase Order',
-  headerFields:[ {id:'bizName', label:'Company name', placeholder:'Imran Electronics'}, {id:'docNumber', label:'PO number', placeholder:'PO-1001'}, {id:'docDate', label:'Date', type:'date'}, {id:'validity', label:'Delivery date', type:'date'} ],
-  partyFields:[ {id:'party', label:'Supplier', placeholder:'Supplier name & address'}, {id:'bizAddress', label:'Your company address', placeholder:'Address, city, phone'} ],
-  itemCols:[ {id:'desc', label:'Item'}, {id:'qty', label:'Qty', type:'number'}, {id:'rate', label:'Rate', type:'number'} ],
-  showTax:false, showDiscount:false, notesLabel:'Notes'
-});
-TOOL_RENDERERS['receipt-generator'] = (mount)=> renderDocGenerator(mount, {
-  docLabel:'Receipt',
-  headerFields:[ {id:'bizName', label:'Business name', placeholder:'Imran Electronics'}, {id:'docNumber', label:'Receipt number', placeholder:'RCP-1001'}, {id:'docDate', label:'Date', type:'date'} ],
-  partyFields:[ {id:'party', label:'Received from', placeholder:'Customer name'}, {id:'bizAddress', label:'Your business address', placeholder:'Address, city, phone'} ],
-  itemCols:[ {id:'desc', label:'Item'}, {id:'qty', label:'Qty', type:'number'}, {id:'rate', label:'Price', type:'number'} ],
-  showTax:false, showDiscount:false, notesLabel:'Payment method / notes'
+
+document.addEventListener('keydown', function (e) {
+
+    // F12
+    if (e.key === 'F12') {
+        e.preventDefault();
+    }
+
+    // Ctrl+Shift+I / Ctrl+Shift+J / Ctrl+Shift+C
+    if (
+        e.ctrlKey &&
+        e.shiftKey &&
+        ['I', 'J', 'C'].includes(e.key.toUpperCase())
+    ) {
+        e.preventDefault();
+    }
+
+    // Ctrl+U (View Source)
+    if (e.ctrlKey && e.key.toUpperCase() === 'U') {
+        e.preventDefault();
+    }
+
+    // Ctrl+S (Save Page)
+    if (e.ctrlKey && e.key.toUpperCase() === 'S') {
+        e.preventDefault();
+    }
 });
 </script>
 </body>
